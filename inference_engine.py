@@ -10,41 +10,42 @@ class LogicalRCA:
         
         # ■ 障害シグネチャ（知識ベース）
         # 「この種のアラームの組み合わせが発生したら、この障害と特定する」というルール
+        # lambda内で .lower() を使うことで、大文字小文字の揺らぎを吸収
         self.signatures = [
             {
                 "type": "Hardware/Critical_Multi_Fail",
                 "label": "複合ハードウェア障害",
-                "rules": lambda alarms: any("Power Supply" in a.message for a in alarms) and any("Fan" in a.message for a in alarms),
+                "rules": lambda alarms: any("power supply" in a.message.lower() for a in alarms) and any("fan" in a.message.lower() for a in alarms),
                 "base_score": 1.0
             },
             {
                 "type": "Hardware/Physical",
                 "label": "ハードウェア障害 (電源/デバイス)",
-                "rules": lambda alarms: any(k in a.message for a in alarms for k in ["Power Supply", "Device Down"]),
+                "rules": lambda alarms: any(k in a.message.lower() for a in alarms for k in ["power supply", "device down"]),
                 "base_score": 0.95
             },
             {
                 "type": "Network/Link",
                 "label": "物理リンク/インターフェース障害",
-                "rules": lambda alarms: any(k in a.message for a in alarms for k in ["Interface Down", "Connection Lost", "Heartbeat Loss"]),
+                "rules": lambda alarms: any(k in a.message.lower() for a in alarms for k in ["interface down", "connection lost", "heartbeat loss"]),
                 "base_score": 0.90
             },
             {
                 "type": "Hardware/Fan",
                 "label": "冷却ファン故障",
-                "rules": lambda alarms: any("Fan Fail" in a.message for a in alarms),
+                "rules": lambda alarms: any("fan fail" in a.message.lower() for a in alarms),
                 "base_score": 0.70
             },
             {
                 "type": "Config/Software",
                 "label": "設定ミス/プロトコル障害",
-                "rules": lambda alarms: any(k in a.message for a in alarms for k in ["BGP", "OSPF", "Config"]),
+                "rules": lambda alarms: any(k in a.message.lower() for a in alarms for k in ["bgp", "ospf", "config"]),
                 "base_score": 0.60
             },
             {
                 "type": "Resource/Capacity",
                 "label": "リソース枯渇 (CPU/Memory)",
-                "rules": lambda alarms: any(k in a.message for a in alarms for k in ["CPU", "Memory", "High"]),
+                "rules": lambda alarms: any(k in a.message.lower() for a in alarms for k in ["cpu", "memory", "high"]),
                 "base_score": 0.50
             }
         ]
@@ -78,6 +79,7 @@ class LogicalRCA:
                         max_score = score
                         best_match = sig
             
+            # シグネチャにマッチした場合
             if best_match:
                 candidates.append({
                     "id": device_id,
@@ -86,12 +88,66 @@ class LogicalRCA:
                     "prob": max_score, # リスクスコア (0.0 - 1.0)
                     "alarms": [a.message for a in alarms]
                 })
+            # どのアラーム定義にも当てはまらないが、アラームが出ている場合（その他）
+            elif alarms:
+                candidates.append({
+                    "id": device_id,
+                    "type": "Unknown/Other",
+                    "label": "その他異常検知",
+                    "prob": 0.3, # 低めのスコア
+                    "alarms": [a.message for a in alarms]
+                })
 
-        # 3. ソート (スコアが高い順)
+        # 3. ★トポロジー相関分析 (サイレント障害検知)
+        # 「配下のデバイスが複数ダウンしているのに、自分は無言」な親ノードを探す
+        
+        down_children_count = {} # parent_id -> count
+        
+        for alarm in current_alarms:
+            msg = alarm.message.lower()
+            # 接続断系のアラームが出ている機器の親を特定
+            if "connection lost" in msg or "interface down" in msg:
+                # 安全対策: デバイスIDがトポロジーに存在するか確認
+                node = self.topology.get(alarm.device_id)
+                if node and node.parent_id:
+                    pid = node.parent_id
+                    down_children_count[pid] = down_children_count.get(pid, 0) + 1
+
+        for parent_id, count in down_children_count.items():
+            # 閾値: 配下が2台以上同時に死んでいる場合
+            if count >= 2:
+                # 安全対策: 親IDがトポロジーに存在するか確認
+                parent_node = self.topology.get(parent_id)
+                if not parent_node: continue 
+
+                # 親ノードが既に候補（アラーム持ち）かどうか確認
+                existing = next((c for c in candidates if c['id'] == parent_id), None)
+                
+                if existing:
+                    # 既に候補ならスコアを強化 (アラーム + 配下全滅 = 確定)
+                    existing['prob'] = 1.0
+                    existing['label'] += " (配下多重断)"
+                else:
+                    # アラームが無いのに配下が死んでいる -> サイレント障害として新規追加
+                    candidates.append({
+                        "id": parent_id,
+                        "type": "Network/Silent",
+                        "label": "サイレント障害 (配下デバイス一斉断)",
+                        "prob": 0.98, # 非常に高い危険度
+                        "alarms": [f"Downstream Impact: {count} devices lost"]
+                    })
+
+        # 4. ソート (スコアが高い順)
         candidates.sort(key=lambda x: x["prob"], reverse=True)
         
-        # 候補がない場合
+        # 候補がない場合（正常稼働）
         if not candidates:
-            candidates.append({"id": "System", "type": "Normal", "label": "正常稼働中", "prob": 0.0})
+            candidates.append({
+                "id": "System", 
+                "type": "Normal", 
+                "label": "正常稼働中", 
+                "prob": 0.0,
+                "alarms": []
+            })
             
         return candidates
