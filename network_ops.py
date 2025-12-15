@@ -32,78 +32,52 @@ def sanitize_output(text: str) -> str:
     return text
 
 def generate_fake_log_by_ai(scenario_name, target_node, api_key):
+    """
+    シナリオ名と機器メタデータから、AIが自律的に障害ログを生成する
+    （ルールベースの分岐を廃止）
+    """
     if not api_key: return "Error: API Key Missing"
     
     genai.configure(api_key=api_key)
-    # ★変更: gemma-3-12b-it
+    # 推論能力が高いモデルを使用
     model = genai.GenerativeModel(
         "gemma-3-12b-it",
-        generation_config={"temperature": 0.0}
+        generation_config={"temperature": 0.2} # 多少の創造性を持たせるため0.0から少し上げる
     )
     
-    vendor = target_node.metadata.get("vendor", "Unknown Vendor")
-    os_type = target_node.metadata.get("os", "Unknown OS")
+    # ノード情報（JSONから取得）
+    vendor = target_node.metadata.get("vendor", "Generic")
+    os_type = target_node.metadata.get("os", "Generic OS")
     model_name = target_node.metadata.get("model", "Generic Device")
     hostname = target_node.id
 
-    status_instructions = ""
-    if "電源" in scenario_name and "片系" in scenario_name:
-        status_instructions = """
-        【状態定義: 電源冗長稼働中 (片系ダウン)】
-        1. ハードウェアステータス: Power Supply 1: **Faulty / Failed**, Power Supply 2: **OK**
-        2. サービス影響: なし (インターフェース UP, Ping 成功)
-        3. エラーログ: 電源障害を示すSyslogまたはTrapを含めること。
-        """
-    elif "電源" in scenario_name and "両系" in scenario_name:
-        status_instructions = """
-        【状態定義: 全電源喪失】
-        1. ログ: "Connection Refused" または再起動直後のブートログのみ。
-        """
-    elif "FAN" in scenario_name:
-        status_instructions = """
-        【状態定義: ファン故障】
-        1. ハードウェアステータス: Fan Tray 1 **Failure**
-        2. 温度: 上昇中だが閾値内 (Warning)
-        3. サービス影響: なし
-        """
-    elif "メモリ" in scenario_name:
-        status_instructions = """
-        【状態定義: メモリリーク】
-        1. メモリ使用率: **98%以上**
-        2. プロセス: 特定のプロセス（例: SSHD, FlowMonitor等）が異常消費している様子を明確に示すこと。
-        3. Syslog: メモリ割り当て失敗 (Malloc Fail) を含めること。
-        """
-    elif "BGP" in scenario_name:
-        status_instructions = """
-        【状態定義: BGPフラッピング】
-        1. BGP状態: 特定のNeighborが Idle / Active を繰り返している。
-        2. 物理IF: UP/UP
-        """
-    elif "全回線断" in scenario_name:
-        status_instructions = """
-        【状態定義: 物理リンクダウン】
-        1. 主要インターフェース: **DOWN / DOWN** (Carrier Loss)
-        2. Ping: 100% Loss
-        """
-
+    # プロンプト：AIへの指示書
+    # 具体的な「電源ならこうしろ」という指示を削除し、
+    # 「シナリオ名を解釈して、それっぽいログを作れ」というメタな指示に変更
     prompt = f"""
-    あなたはネットワーク機器のCLIシミュレーターです。
-    指定された機器スペックと障害シナリオに基づき、エンジニアが調査を行った際の「コマンド実行ログ」を生成してください。
+    あなたはネットワーク機器のCLIシミュレーター（熟練エンジニアのロールプレイング）です。
+    ユーザーが指定した「障害シナリオ」に基づいて、トラブルシューティング時に実行されるであろう
+    **「コマンド」とその「実行結果ログ」** を生成してください。
 
-    **対象機器スペック**:
-    - Hostname: {hostname}
-    - Vendor: {vendor}
-    - OS: {os_type}
-    - Model: {model_name}
+    【入力情報】
+    - 対象ホスト名: {hostname}
+    - ベンダー: {vendor}
+    - OS種別: {os_type}
+    - モデル: {model_name}
+    - **発生している障害シナリオ**: 「{scenario_name}」
 
-    **発生シナリオ**: {scenario_name}
+    【AIへの指示】
+    1. **シナリオの解釈**: 提供されたシナリオ名（例: "電源障害", "BGP Flapping", "Cable Cut"など）から、技術的にどのような状態であるべきか推測してください。
+    2. **コマンド選択**: その障害を確認するために、このベンダー({vendor})でよく使われる確認コマンドを2〜3個選んでください。（例: show environment, show log, show ip bgp sum, show interface 等）
+    3. **ログ生成**: 選んだコマンドに対し、シナリオ通りの異常状態を示す出力を生成してください。
+       - 電源障害なら: Power Supply Status を Faulty/Failed にする。
+       - インターフェース障害なら: Protocol Down にする。
+       - 正常稼働なら: 全て OK/Up にする。
+    4. **リアリティ**: タイムスタンプやプロンプトを含め、本物のCLI画面のように出力してください。
 
-    {status_instructions}
-
-    **出力要件**:
-    1. **{vendor} {os_type}** の構文として正しいコマンドと出力形式を使用すること。
-    2. 解説やMarkdown装飾は不要。**CLIの生テキストのみ**を出力すること。
-    3. 矛盾する情報は含めないこと。
+    【出力形式】
+    解説不要。CLIのテキストデータのみを出力してください。
+    Markdownのコードブロックは使用しないでください（生テキストで出力）。
     """
     
     try:
@@ -115,7 +89,6 @@ def generate_fake_log_by_ai(scenario_name, target_node, api_key):
 def generate_config_from_intent(target_node, current_config, intent_text, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    # ★変更: gemma-3-12b-it
     model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     vendor = target_node.metadata.get("vendor", "Unknown Vendor")
@@ -137,7 +110,6 @@ def generate_config_from_intent(target_node, current_config, intent_text, api_ke
 def generate_health_check_commands(target_node, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    # ★変更: gemma-3-12b-it
     model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     vendor = target_node.metadata.get("vendor", "Unknown Vendor")
@@ -152,23 +124,37 @@ def generate_health_check_commands(target_node, api_key):
 
 def generate_remediation_commands(scenario, analysis_result, target_node, api_key):
     """
-    障害シナリオと分析結果に基づき、復旧コマンドを生成する
+    障害シナリオと分析結果に基づき、復旧手順（物理対応＋コマンド＋確認）を生成する
     """
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     prompt = f"""
-    あなたは熟練したネットワークエンジニアです。以下の障害に対する「復旧用コマンド（Config）」を作成してください。
+    あなたは熟練したネットワークエンジニアです。
+    発生している障害に対して、オペレーターが実行すべき**「完全な復旧手順書」**を作成してください。
     
     対象デバイス: {target_node.id} ({target_node.metadata.get('vendor')} {target_node.metadata.get('os')})
     発生シナリオ: {scenario}
     AI分析結果: {analysis_result}
     
-    【要件】
-    1. 復旧に必要な具体的なコマンドのみを列挙すること。
-    2. 説明文は不要。Markdownコードブロック形式で出力すること。
-    3. 特権モード(enable)等は省略し、設定モード等の主要コマンドから書くこと。
+    【重要: 出力要件】
+    以下の3つのセクションを必ず含めてください。Markdown形式で出力すること。
+
+    ### 1. 物理・前提アクション (Physical Actions)
+    * 電源障害やケーブル断、FAN故障の場合、「交換手順」や「結線確認」を具体的に指示してください。
+    * 例：「故障した電源ユニット(PSU1)を交換してください」「LANケーブルを再結線してください」など。
+    * ソフトウェア設定のみで直る場合は「特になし」で構いません。
+
+    ### 2. 復旧コマンド (Recovery Config)
+    * 設定変更や再起動が必要な場合のコマンド。
+    * 物理交換だけで復旧する場合でも、念のためのインターフェースリセット手順などを記載してください。
+    * コマンドは Markdownのコードブロック(```) で囲んでください。
+
+    ### 3. 正常性確認コマンド (Verification Commands)
+    * 対応後に正常に戻ったかを確認するためのコマンド（showコマンドやpingなど）。
+    * 必ず3つ以上提示してください。
+    * コマンドは Markdownのコードブロック(```) で囲んでください。
     """
     
     try:
