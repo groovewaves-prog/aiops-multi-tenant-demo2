@@ -3,6 +3,7 @@ import graphviz
 import os
 import time
 import google.generativeai as genai
+from network_ops import run_diagnostic_simulation, generate_remediation_commands, predict_initial_symptoms
 
 # モジュール群のインポート
 from data import TOPOLOGY
@@ -116,11 +117,25 @@ with st.sidebar:
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
 
-# --- セッション管理 ---
+# --- セッション管理 (★ここを修正: 全変数を確実に初期化) ---
 if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
-    st.session_state.last_report_scenario = None 
 
+# 必須変数がなければ初期化 (AttributeError防止)
+if "live_result" not in st.session_state:
+    st.session_state.live_result = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "chat_session" not in st.session_state:
+    st.session_state.chat_session = None
+if "trigger_analysis" not in st.session_state:
+    st.session_state.trigger_analysis = False
+if "verification_result" not in st.session_state:
+    st.session_state.verification_result = None
+if "generated_report" not in st.session_state:
+    st.session_state.generated_report = None
+
+# シナリオ切り替え時のリセット処理
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
     st.session_state.messages = []      
@@ -181,18 +196,24 @@ else:
             alarms = [Alarm(target_device_id, "Memory High", "WARNING")]
             root_severity = "WARNING"
 
-# 2. ベイズエンジン初期化
+# 2. ベイズエンジン初期化 & 初期証拠注入
 if "bayes_engine" not in st.session_state:
     st.session_state.bayes_engine = BayesianRCA(TOPOLOGY)
-    if "BGP" in selected_scenario:
-        st.session_state.bayes_engine.update_probabilities("alarm", "BGP Flapping")
-    elif "全回線断" in selected_scenario or "両系" in selected_scenario:
-        st.session_state.bayes_engine.update_probabilities("ping", "NG")
-        st.session_state.bayes_engine.update_probabilities("log", "Interface Down")
-    elif "片系" in selected_scenario:
-        st.session_state.bayes_engine.update_probabilities("alarm", "HA Failover")
-    elif "FAN" in selected_scenario:
-        st.session_state.bayes_engine.update_probabilities("alarm", "Fan Fail")
+    
+    if selected_scenario != "正常稼働" and api_key:
+        # ★ここが変更点: if分岐を廃止し、AIに症状を予測させる
+        # シナリオ名だけ渡せば、AIが「BGPならBGP Flappingだ」と判断してJSONを返す
+        initial_symptoms = predict_initial_symptoms(selected_scenario, api_key)
+        
+        # AIが返した症状をベイズエンジンに注入
+        if initial_symptoms.get("alarm"):
+            st.session_state.bayes_engine.update_probabilities("alarm", initial_symptoms["alarm"])
+        
+        if initial_symptoms.get("ping") == "NG":
+            st.session_state.bayes_engine.update_probabilities("ping", "NG")
+            
+        if initial_symptoms.get("log"):
+            st.session_state.bayes_engine.update_probabilities("log", initial_symptoms["log"])
 
 # 3. コックピット表示
 selected_incident_candidate = None
@@ -321,7 +342,6 @@ with col_chat:
                  else:
                     with st.spinner("Generating plan..."):
                         t_node = TOPOLOGY.get(selected_incident_candidate["id"])
-                        # ★ここが重要: 修正されたプロンプトで、手順書(Markdown)が返ってくる
                         plan_md = generate_remediation_commands(
                             selected_scenario, 
                             f"Identified Root Cause: {selected_incident_candidate['type']}", 
@@ -330,7 +350,6 @@ with col_chat:
                         st.session_state.remediation_plan = plan_md
                         st.rerun()
         
-        # ★ここを修正: st.code ではなく st.markdown で表示
         if "remediation_plan" in st.session_state:
             with st.container(border=True):
                 st.info("AI Generated Recovery Procedure")
