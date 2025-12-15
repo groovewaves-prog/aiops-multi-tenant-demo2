@@ -65,7 +65,6 @@ def render_topology(alarms, root_cause_candidates):
     alarm_map = {a.device_id: a for a in alarms}
     alarmed_ids = set(alarm_map.keys())
     
-    # AIが特定した根本原因IDのセット（スコア0.6以上）
     root_cause_ids = {c['id'] for c in root_cause_candidates if c['prob'] > 0.6}
     
     for node_id, node in TOPOLOGY.items():
@@ -79,14 +78,12 @@ def render_topology(alarms, root_cause_candidates):
         vendor = node.metadata.get("vendor")
         if vendor: label += f"\n[{vendor}]"
 
-        # 色分けロジック
         if node_id in root_cause_ids:
             this_alarm = alarm_map.get(node_id)
             if this_alarm and this_alarm.severity == "WARNING":
-                color = "#fff9c4" # Yellow
+                color = "#fff9c4" 
             else:
-                color = "#ffcdd2" # Red
-            
+                color = "#ffcdd2" # Root Cause
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
             
@@ -118,7 +115,6 @@ else:
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚡ Scenario Controller")
-    # 文法エラー修正箇所: リストの閉じ括弧とカンマを確実に記述
     SCENARIO_MAP = {
         "基本・広域障害": ["正常稼働", "1. WAN全回線断", "2. FW片系障害", "3. L2SWサイレント障害"],
         "WAN Router": ["4. [WAN] 電源障害：片系", "5. [WAN] 電源障害：両系", "6. [WAN] BGPルートフラッピング", "7. [WAN] FAN故障", "8. [WAN] メモリリーク"],
@@ -182,18 +178,14 @@ elif "FW片系障害" in selected_scenario:
         root_severity = "WARNING"
 
 elif "L2SWサイレント障害" in selected_scenario:
-    # 検索条件を修正: 具体的に "L2_SW_01" (APの親) を指定
     target_device_id = "L2_SW_01"
-    
     if target_device_id not in TOPOLOGY:
         target_device_id = find_target_node_id(TOPOLOGY, keyword="L2_SW")
-        
     if target_device_id and target_device_id in TOPOLOGY:
-        # 子ノード(APなど)をすべてダウンさせる
         child_nodes = [nid for nid, n in TOPOLOGY.items() if n.parent_id == target_device_id]
         alarms = [Alarm(child, "Connection Lost", "CRITICAL") for child in child_nodes]
     else:
-        st.error("Error: L2 Switch definition not found in data.py")
+        st.error("Error: L2 Switch definition not found")
 
 elif "複合障害" in selected_scenario:
     target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
@@ -210,7 +202,6 @@ elif "同時多発" in selected_scenario:
     if ap_node: alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
     target_device_id = fw_node 
 else:
-    # 個別障害の判定
     if "[WAN]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
     elif "[FW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
     elif "[L2SW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="SWITCH", layer=4)
@@ -234,13 +225,12 @@ else:
             alarms = [Alarm(target_device_id, "Memory High", "WARNING")]
             root_severity = "WARNING"
 
-# 2. 推論エンジンによる分析 (Deterministic Analysis)
+# 2. 推論エンジンによる分析
 analysis_results = st.session_state.logic_engine.analyze(alarms)
 
 # 3. コックピット表示
 selected_incident_candidate = None
 
-# --- 簡易ダッシュボード表示 ---
 st.markdown("### 🛡️ AIOps インシデント・コックピット")
 col1, col2, col3 = st.columns(3)
 with col1: st.metric("📉 ノイズ削減率", "98.5%", "高効率稼働中")
@@ -248,8 +238,6 @@ with col2: st.metric("📨 処理アラーム数", f"{len(alarms) * 15 if alarms
 with col3: st.metric("🚨 要対応インシデント", f"{len([c for c in analysis_results if c['prob'] > 0.6])}件", "対処が必要")
 st.markdown("---")
 
-# データフレーム表示
-import pandas as pd
 df_data = []
 for rank, cand in enumerate(analysis_results[:5], 1):
     status = "⚪ 監視中"
@@ -286,7 +274,6 @@ event = st.dataframe(
     on_select="rerun"
 )
 
-# 選択処理
 if len(event.selection.rows) > 0:
     idx = event.selection.rows[0]
     sel_row = df.iloc[idx]
@@ -308,11 +295,8 @@ with col_map:
     current_root_node = None
     current_severity = "WARNING"
     
-    # 選択中のインシデントがあれば、それをルートとして表示
     if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
         current_root_node = TOPOLOGY.get(selected_incident_candidate["id"])
-        
-        # 色決定ロジック
         if "Hardware/Physical" in selected_incident_candidate["type"] or "Critical" in selected_incident_candidate["type"] or "Silent" in selected_incident_candidate["type"]:
             current_severity = "CRITICAL"
         else:
@@ -357,6 +341,12 @@ with col_map:
         if res["status"] == "SUCCESS":
             st.markdown("#### 📄 Diagnostic Results")
             with st.container(border=True):
+                # ★追加: 能動的診断ログの表示（もしあれば）
+                if selected_incident_candidate and selected_incident_candidate.get("verification_log"):
+                    st.caption("🤖 Active Probe / Verification Log")
+                    st.code(selected_incident_candidate["verification_log"], language="text")
+                    st.divider()
+
                 if st.session_state.verification_result:
                     v = st.session_state.verification_result
                     c1, c2, c3 = st.columns(3)
@@ -390,6 +380,9 @@ with col_chat:
                     genai.configure(api_key=api_key)
                     model = genai.GenerativeModel("gemma-3-12b-it")
                     
+                    # ★修正: 能動診断ログをプロンプトに注入
+                    verification_context = cand.get("verification_log", "特になし")
+                    
                     prompt = f"""
                     あなたはネットワーク運用監視のプロフェッショナルです。
                     以下の障害インシデントについて、顧客向けの「詳細な状況報告レポート」を作成してください。
@@ -398,6 +391,11 @@ with col_chat:
                     - 発生シナリオ: {selected_scenario}
                     - 根本原因候補: {cand['id']} ({cand['label']})
                     - リスクスコア: {cand['prob']*100:.0f}
+                    
+                    【★重要: AIによる能動的診断結果 (Reasoning)】
+                    システムはアラームだけでなく、以下の能動的な確認を行いました。この内容を「対応」や「特定根拠」に含めてください。
+                    {verification_context}
+
                     - 対象機器Config: 
                     {target_conf[:1500]} (抜粋)
 
@@ -417,8 +415,8 @@ with col_chat:
                     **3. 詳細情報**
                     (機器情報など)
                     
-                    **4. 対応**
-                    (対応策)
+                    **4. 対応と特定根拠**
+                    (★ここに能動的診断の結果を反映して記述)
                     
                     **5. 今後の対応**
                     (今後)
