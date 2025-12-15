@@ -4,6 +4,7 @@ Google Antigravity AIOps Agent - Network Operations Module
 import re
 import os
 import time
+import json
 import google.generativeai as genai
 from netmiko import ConnectHandler
 
@@ -192,3 +193,45 @@ def run_diagnostic_simulation(scenario_type, target_node=None, api_key=None):
             return {"status": "SUCCESS", "sanitized_log": sanitize_output(raw_output), "error": None}
         else:
             return {"status": "ERROR", "sanitized_log": "", "error": "API Key or Target Node Missing"}
+
+def predict_initial_symptoms(scenario_name, api_key):
+    """
+    障害シナリオ名から、発生しうる「初期症状（アラーム、ログ、Pingなど）」を
+    AIに推論させ、ベイズエンジンへの入力データとして返す。
+    """
+    if not api_key: return {}
+    
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+    
+    prompt = f"""
+    あなたはネットワーク監視システムのAIエージェントです。
+    指定された「障害シナリオ」において、監視システムが最初に検知するであろう「初期症状」を推論してください。
+
+    **シナリオ**: {scenario_name}
+
+    【出力要件】
+    1. 以下のキーを持つ **JSON形式** で出力すること。解説は不要。
+       - "alarm": アラームメッセージ (例: "BGP Flapping", "Fan Fail", "Power Supply Failed", "HA Failover")
+       - "ping": 疎通状態 (例: "NG", "OK")
+       - "log": ログキーワード (例: "Interface Down", "System Warning", "Power Fail")
+    
+    2. 値は以下のキーワードリストから最も適切なものを選んでください（これらに当てはまらない場合は空文字 "" にすること）。
+       - アラーム系: "BGP Flapping", "Fan Fail", "Heartbeat Loss", "Connection Lost", "Power Supply 1 Failed", "Power Supply: Dual Loss (Device Down)"
+       - ログ系: "Interface Down", "Power Fail", "Config Error", "High Temperature"
+       - Ping系: "NG", "OK"
+
+    **例**:
+    シナリオ: "[WAN] BGPルートフラッピング"
+    出力: {{ "alarm": "BGP Flapping", "ping": "OK", "log": "" }}
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        text = response.text
+        # Markdownのコードブロック記号を削除してJSONパース
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"Symptom Prediction Error: {e}")
+        return {}
