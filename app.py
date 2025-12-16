@@ -386,7 +386,11 @@ def render_topology(alarms, root_cause_candidates):
 
         status_type = node_status_map.get(node_id, "Normal")
         
-        if "Hardware/Physical" in status_type or "Critical" in status_type or "Silent" in status_type:
+        if "Silent" in status_type:
+            color = "#fff3e0"
+            penwidth = "4"
+            label += "\n[サイレント疑い]"
+        elif "Hardware/Physical" in status_type or "Critical" in status_type:
             color = "#ffcdd2" 
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
@@ -589,7 +593,15 @@ else:
             root_severity = "WARNING"
 
 # 2. 推論エンジンによる分析
-analysis_results = st.session_state.logic_engine.analyze(alarms)
+# --- Silent failure 표현 강화: シナリオに応じてRCAエンジンの閾値を調整 ---
+engine = st.session_state.logic_engine
+# デフォルト（保守的）
+engine.SILENT_MIN_CHILDREN = getattr(engine, "SILENT_MIN_CHILDREN", 2) or 2
+engine.SILENT_RATIO = 0.5
+# サイレント障害シナリオでは「少数端末の同時断」でも上位SWを疑えるよう感度を上げる
+if "サイレント" in selected_scenario:
+    engine.SILENT_RATIO = 0.3
+analysis_results = engine.analyze(alarms)
 
 # 3. コックピット表示
 selected_incident_candidate = None
@@ -607,14 +619,20 @@ df_data = []
 for rank, cand in enumerate(analysis_results, 1):
     status = "⚪ 監視中"
     action = "👁️ 静観"
-    
-    if cand['prob'] > 0.8:
-        status = "🔴 危険 (根本原因)"
-        action = "🚀 自動修復が可能"
-    elif cand['prob'] > 0.6:
-        status = "🟡 警告 (被疑箇所)"
-        action = "🔍 詳細調査を推奨"
-    
+
+    # サイレント障害の表現強化: 症状(端末)ではなく「上位設備の疑い」として強調
+    is_silent = ("SilentFailure" in str(cand.get("type","")) or "Silent" in str(cand.get("type","")) or "サイレント" in str(cand.get("type","")))
+    if is_silent:
+        status = "🟣 サイレント疑い (上位設備)"
+        action = "🔍 上位SW/配下影響を確認"
+    else:
+        if cand['prob'] > 0.8:
+            status = "🔴 危険 (根本原因)"
+            action = "🚀 自動修復が可能"
+        elif cand['prob'] > 0.6:
+            status = "🟡 警告 (被疑箇所)"
+            action = "🔍 詳細調査を推奨"
+
     if "Network/Unreachable" in cand['type'] or "Network/Secondary" in cand['type']:
         status = "⚫ 応答なし (上位障害)"
         action = "⛔ 対応不要 (上位復旧待ち)"
