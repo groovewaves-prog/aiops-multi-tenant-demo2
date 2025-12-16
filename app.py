@@ -599,6 +599,9 @@ engine.SILENT_RATIO = 0.5
 if "サイレント" in selected_scenario:
     engine.SILENT_RATIO = 0.3
 analysis_results = engine.analyze(alarms)
+# このスコープの状態（停止/要対応/注意/正常）
+scope_status = _status_from_alarms(selected_scenario, alarms)
+
 
 # 3. コックピット表示
 selected_incident_candidate = None
@@ -645,7 +648,7 @@ for rank, cand in enumerate(analysis_results, 1):
         "順位": rank,
         "ステータス": status,
         "根本原因候補": candidate_text,
-        "リスクスコア": cand['prob'],
+        "リスクスコア": (None if scope_status == "停止" else cand['prob']),
         "推奨アクション": action,
         "ID": cand['id'],
         "Type": cand['type']
@@ -657,9 +660,15 @@ st.info("💡 ヒント: インシデントの行をクリックすると、右�
 event = st.dataframe(
     df,
     column_order=["順位", "ステータス", "根本原因候補", "リスクスコア", "推奨アクション"],
-    column_config={
-        "リスクスコア": st.column_config.ProgressColumn("リスクスコア (0-1.0)", format="%.2f", min_value=0, max_value=1),
-    },
+    column_config=(
+        {
+            "リスクスコア": st.column_config.TextColumn("リスクスコア", help="停止中は評価対象外", width="small")
+        }
+        if scope_status == "停止"
+        else {
+            "リスクスコア": st.column_config.ProgressColumn("リスクスコア (0-1.0)", format="%.2f", min_value=0, max_value=1),
+        }
+    ),
     use_container_width=True,
     hide_index=True,
     selection_mode="single-row",
@@ -780,7 +789,7 @@ with col_chat:
                     【入力情報】
                     - 発生シナリオ: {selected_scenario}
                     - 根本原因候補: {cand['id']} ({cand['label']})
-                    - リスクスコア: {cand['prob']*100:.0f}
+                    - リスクスコア: {"N/A（停止中のため評価対象外）" if scope_status=="停止" else f"{cand['prob']*100:.0f}"}
                     
                     【★重要: AIによる能動的診断結果 (Reasoning)】
                     システムはアラームだけでなく、以下の能動的な確認を行いました。この内容を「対応」や「特定根拠」に含めてください。
@@ -917,10 +926,10 @@ with col_chat:
                     st.rerun()
     else:
         if selected_incident_candidate:
-            score = selected_incident_candidate['prob'] * 100
+            score = (None if scope_status == "停止" else selected_incident_candidate['prob'] * 100)
             st.warning(f"""
             ⚠️ **自動修復はロックされています**
-            現在選択されているインシデントのリスクスコアは **{score:.0f}** です。
+            現在選択されているインシデントのリスクスコアは **{('N/A（停止中のため評価対象外）' if score is None else f'{score:.0f}')}** です。
             誤操作防止のため、スコアが 60 以上の時のみ自動修復ボタンが有効化されます。
             """)
 
