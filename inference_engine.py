@@ -21,6 +21,7 @@ class LogicalRCA:
       - LLM によるコンフィグ解釈（ベンダ差分の吸収）
       - トポロジー文脈（親子関係）を用いたカスケード抑制
       - “冗長が効いてるなら黄色、止まってるなら赤” を優先
+      - LLM無しでも安定するように、FAN/メモリ系のローカル安全ルールを追加
     """
 
     def __init__(self, topology, config_dir: str = "./configs"):
@@ -224,13 +225,19 @@ class LogicalRCA:
         safe_alerts = [self._sanitize_text(a) for a in alerts]
         joined = " ".join(safe_alerts)
 
-        if ("Dual Loss" in joined) or ("Device Down" in joined) or ("Thermal Shutdown" in joined):
+        # ----------------------------------------------------------
+        # (0) 強制停止（赤）確定：明確な停止・シャットダウン
+        # ----------------------------------------------------------
+        if ("Power Supply: Dual Loss" in joined) or ("Dual Loss" in joined) or ("Device Down" in joined) or ("Thermal Shutdown" in joined):
             return {
                 "status": HealthStatus.CRITICAL,
-                "reason": "Dual PSU loss / device down detected (local safety rule).",
+                "reason": "Device down / dual PSU loss / thermal shutdown detected (local safety rule).",
                 "impact_type": "Hardware/Physical"
             }
 
+        # ----------------------------------------------------------
+        # (1) 電源：片系（黄色/赤）
+        # ----------------------------------------------------------
         psu_count = self._get_psu_count(device_id, default=1)
         psu_single_fail = (
             ("Power Supply" in joined and "Failed" in joined and "Dual" not in joined)
@@ -249,6 +256,47 @@ class LogicalRCA:
                 "impact_type": "Hardware/Physical"
             }
 
+        # ----------------------------------------------------------
+        # (2) FAN 故障：基本は黄色、ただし過熱/停止兆候があれば赤
+        #   app.py では 'Fan Fail' を生成しているため、それを確実に捕捉
+        # ----------------------------------------------------------
+        fan_fail = ("Fan Fail" in joined) or ("FAN" in joined and "Fail" in joined) or ("Fan" in joined and "Fail" in joined)
+        overheat_hint = ("High Temperature" in joined) or ("Overheat" in joined) or ("Thermal" in joined)
+        if fan_fail:
+            if overheat_hint:
+                return {
+                    "status": HealthStatus.CRITICAL,
+                    "reason": "Fan failure with overheat/thermal symptom detected (local safety rule).",
+                    "impact_type": "Hardware/Physical"
+                }
+            return {
+                "status": HealthStatus.WARNING,
+                "reason": "Fan failure detected. Service likely continues but risk of thermal escalation (local safety rule).",
+                "impact_type": "Hardware/Degraded"
+            }
+
+        # ----------------------------------------------------------
+        # (3) メモリ高騰/リーク：基本は黄色、OOM/プロセスクラッシュ兆候があれば赤
+        #   app.py では 'Memory High' を生成しているため、それを確実に捕捉
+        # ----------------------------------------------------------
+        mem_symptom = ("Memory High" in joined) or ("Memory Leak" in joined) or ("memory" in joined.lower() and ("leak" in joined.lower() or "high" in joined.lower()))
+        oom_hint = ("Out of memory" in joined) or ("OOM" in joined) or ("killed process" in joined.lower()) or ("kernel panic" in joined.lower())
+        if mem_symptom:
+            if oom_hint:
+                return {
+                    "status": HealthStatus.CRITICAL,
+                    "reason": "Memory leak/high with OOM/crash symptom detected (local safety rule).",
+                    "impact_type": "Software/Resource"
+                }
+            return {
+                "status": HealthStatus.WARNING,
+                "reason": "Memory high/leak symptom detected. Likely degraded but not down yet (local safety rule).",
+                "impact_type": "Software/Resource"
+            }
+
+        # ----------------------------------------------------------
+        # (4) LLMに委譲（APIキーがある場合）
+        # ----------------------------------------------------------
         if not self._ensure_api_configured():
             return {
                 "status": HealthStatus.WARNING,
