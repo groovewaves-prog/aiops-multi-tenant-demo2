@@ -5,6 +5,8 @@ import time
 import google.generativeai as genai
 import json
 import pandas as pd
+from collections import deque
+
 from google.api_core import exceptions as google_exceptions
 
 # モジュール群のインポート
@@ -155,32 +157,69 @@ def _make_alarms(topology: dict, selected_scenario: str):
     return alarms
 
 def _status_from_alarms(selected_scenario: str, alarms) -> str:
-    """全社一覧の状態（停止/劣化/要注意/正常）を判定する。
-    モックのため簡易ルールだが、“停止クラス”のシナリオは優先して停止に寄せる。
+    """全社一覧の状態を判定（停止/劣化（重）/劣化（軽）/要注意/正常）。
+
+    方針:
+    - 停止は最優先（広域断・両系電源断など）
+    - CRITICAL を含む場合は「停止」か「劣化（重）」
+    - WARNING のみは「劣化（軽）」または「要注意」
     """
     if not alarms:
         return "正常"
 
-    # シナリオ起因で停止が明確なもの（優先）
+    # シナリオ起因で停止が明確なもの（最優先）
     if ("WAN全回線断" in selected_scenario) or ("電源障害：両系" in selected_scenario):
         return "停止"
 
     severities = [str(getattr(a, "severity", "")).upper() for a in alarms]
     messages = [str(getattr(a, "message", "")) for a in alarms]
 
-    # CRITICAL が含まれるなら少なくとも劣化。Device Down系なら停止。
-    if any(s == "CRITICAL" for s in severities):
+    has_crit = any(s == "CRITICAL" for s in severities)
+    has_warn = any(s == "WARNING" for s in severities)
+
+    # Device Down / Dual Loss / Unreachable などは停止寄り
+    if has_crit:
         if any(("Device Down" in m) or ("Dual Loss" in m) or ("Unreachable" in m) for m in messages):
             return "停止"
-        return "劣化"
+        # サイレント障害は「停止」ではないが、上位設備疑いとして重度劣化に寄せる
+        if "サイレント" in selected_scenario:
+            return "劣化（重）"
+        # CRITICAL 単発でも重度劣化
+        return "劣化（重）"
 
-    # WARNING/INFO のみ：件数で要注意/劣化を分ける（将来はSLOやImpactで置換）
+    # WARNING/INFO のみ
     n = len(alarms)
-    if n < 3:
-        return "要注意"
-    if n < 10:
-        return "劣化"
-    return "停止"
+    if n >= 10:
+        return "劣化（重）"
+    if n >= 3:
+        return "劣化（軽）"
+    return "要注意"
+
+
+def _status_from_alarm_count(n: int) -> str:
+    # 互換用（旧ロジック）。全社一覧では _status_from_alarms を使用。
+    if n >= 20:
+        return "停止"
+    if n >= 1:
+        return "劣化（軽）"
+    return "正常"
+
+
+def _status_sort_key(status: str) -> int:
+    # 左ほど優先度が高い（停止 → 劣化（重） → 劣化（軽） → 要注意 → 正常）
+    order = {"停止": 0, "劣化（重）": 1, "劣化（軽）": 2, "要注意": 3, "正常": 4}
+    return order.get(status, 99)
+
+
+def _make_status_badge(status: str) -> str:
+    icon = {
+        "停止": "🟥",
+        "劣化（重）": "🟠",
+        "劣化（軽）": "🟡",
+        "要注意": "🟨",
+        "正常": "🟩",
+    }.get(status, "⬜")
+    return f"{icon} {status}"
 
 def _status_from_alarm_count(n: int) -> str:
     # 互換用（旧ロジック）。全社一覧では _status_from_alarms を使用。
@@ -231,13 +270,20 @@ def _collect_all_scopes():
 
 def _build_company_rows(selected_scenario: str):
     """
-    全社の状態を作る（現状は: アラーム件数ベース + Maintenanceフラグ + デルタ）
+    全社の状態行を作る（状態・デルタ・Maintenance・進展リスク履歴 15m/60m）
     """
     maint_flags = st.session_state.get("maint_flags", {}) or {}
 
     # 前回状態（デルタ計算用）
     prev = st.session_state.get("prev_company_snapshot", {}) or {}
 
+    # 進展リスク履歴（最小版）
+    # { "A/default": deque([(ts, is_risky), ...], maxlen=512) }
+    if "risk_history" not in st.session_state:
+        st.session_state.risk_history = {}
+    risk_history = st.session_state.risk_history
+
+    now = time.time()
     rows = []
     for tenant_id, network_id in _collect_all_scopes():
         paths = get_paths(tenant_id, network_id)
@@ -249,9 +295,54 @@ def _build_company_rows(selected_scenario: str):
         status = _status_from_alarms(selected_scenario, alarms)
         is_maint = bool(maint_flags.get(tenant_id, False))
 
-        key = f"{tenant_id}/{network_id}"
-        prev_count = prev.get(key, {}).get("alarm_count")
+        scope_key = f"{tenant_id}/{network_id}"
+        prev_count = prev.get(scope_key, {}).get("alarm_count")
         delta = None if prev_count is None else (alarm_count - prev_count)
+
+        # --------
+        # 進展リスク（Explainableなルールベース / 最小版）
+        # --------
+        # 「劣化（軽）」の段階で、悪化傾向がある場合にリスクを出す。
+        risky = False
+        reasons = []
+
+        if status == "劣化（軽）":
+            if delta is not None and delta > 0:
+                risky = True
+                reasons.append("アラーム件数が増加")
+            # warningが一定以上
+            if alarm_count >= 5:
+                risky = True
+                reasons.append("警告が継続的に発生")
+            if "サイレント" in selected_scenario:
+                risky = True
+                reasons.append("サイレント障害シナリオ（上位設備疑い）")
+
+        # Maintenance中は「予測・煽り」を抑制（事実表示は残す）
+        risk_suppressed = False
+        if is_maint and risky:
+            risk_suppressed = True
+            risky = False
+            reasons = ["🛠 Maintenance中のため進展リスク評価を抑制"]
+
+        # 履歴更新
+        dq = risk_history.get(scope_key)
+        if dq is None:
+            dq = deque(maxlen=512)
+            risk_history[scope_key] = dq
+        dq.append((now, bool(risky), list(reasons)))
+
+        # 集計（15m/60m）
+        def _count_in_window(sec: int) -> int:
+            cutoff = now - sec
+            cnt = 0
+            for ts, is_risk, _rs in dq:
+                if ts >= cutoff and is_risk:
+                    cnt += 1
+            return cnt
+
+        risk_15m = _count_in_window(15 * 60)
+        risk_60m = _count_in_window(60 * 60)
 
         rows.append({
             "tenant": tenant_id,
@@ -261,6 +352,10 @@ def _build_company_rows(selected_scenario: str):
             "alarm_count": alarm_count,
             "delta": delta,
             "maintenance": is_maint,
+            "risk_15m": risk_15m,
+            "risk_60m": risk_60m,
+            "risk_suppressed": risk_suppressed,
+            "risk_reasons": reasons,
         })
 
     # snapshot更新
@@ -268,21 +363,27 @@ def _build_company_rows(selected_scenario: str):
         f'{r["tenant"]}/{r["network"]}': {"alarm_count": r["alarm_count"]} for r in rows
     }
 
+    # risk_historyを戻す（念のため）
+    st.session_state.risk_history = risk_history
+
     return rows
 
-def _render_all_companies_board(selected_scenario: str, df_height: int = 220):
+    return rows
+
+def _render_all_companies_board(selected_scenario: str, df_height: int = 260):
     """
-    上段: 全社状態ボード（停止/劣化/要注意/正常）
+    上段: 全社状態ボード（停止/劣化（重）/劣化（軽）/要注意/正常）
     - 行クリックで tenant/network を選択し、下段コックピットへ反映
+    - 進展リスク履歴（15m/60m）
+    - Maintenance中はリスク抑制（最小版）
     """
     st.subheader("🏢 全社一覧（状態ボード）")
-    st.caption("左ほど優先度が高い（停止 → 劣化 → 要注意 → 正常）。クリック操作は通常は必要としない“状態ボード”です。")
+    st.caption("左ほど優先度が高い（停止 → 劣化（重） → 劣化（軽） → 要注意 → 正常）。クリックは通常必要としない一覧ですが、選択すると下段の詳細に反映されます。")
 
     rows = _build_company_rows(selected_scenario)
 
-    # Bucketごとに並べる
-    buckets = ["停止", "劣化", "要注意", "正常"]
-    cols = st.columns(4, gap="large")
+    buckets = ["停止", "劣化（重）", "劣化（軽）", "要注意", "正常"]
+    cols = st.columns(5, gap="large")
 
     # サマリ（上の小カード）
     counts = {b: sum(1 for r in rows if r["status"] == b) for b in buckets}
@@ -292,7 +393,7 @@ def _render_all_companies_board(selected_scenario: str, df_height: int = 220):
 
     st.markdown("")
 
-    # 各列の中身（スクロール可能な表）
+    # 各列の中身（縦スクロール可能な表）
     for c, b in zip(cols, buckets):
         with c:
             items = [r for r in rows if r["status"] == b]
@@ -302,17 +403,26 @@ def _render_all_companies_board(selected_scenario: str, df_height: int = 220):
                 st.caption("（該当なし）")
                 continue
 
-            # 表示列（5行相当で縦スクロール）
             view_rows = []
             for r in items:
                 d = r["delta"]
                 delta_str = "" if d is None else (f"+{d}" if d > 0 else str(d))
                 maint = "🛠️" if r["maintenance"] else ""
+                risk = ""
+                # 進展リスクは「劣化（軽）」のときだけ表示（抑制中も明示）
+                if r["status"] == "劣化（軽）":
+                    if r.get("risk_suppressed"):
+                        risk = "🛠 抑制"
+                    else:
+                        if (r.get("risk_15m", 0) > 0) or (r.get("risk_60m", 0) > 0):
+                            risk = f"🧭 15m:{r.get('risk_15m',0)} 60m:{r.get('risk_60m',0)}"
+
                 view_rows.append({
                     "会社/ネットワーク": r["company_network"],
                     "Maintenance": maint,
                     "Δ": delta_str,
                     "Alarms": r["alarm_count"],
+                    "進展": risk,
                 })
 
             view_df = pd.DataFrame(view_rows)
@@ -424,7 +534,7 @@ else:
 
 # --- サイドバー ---
 with st.sidebar:
-    st.header("⚡ Scenario Controller")
+    st.header("⚡ シナリオコントローラ")
     SCENARIO_MAP = {
         "基本・広域障害": ["正常稼働", "1. WAN全回線断", "2. FW片系障害", "3. L2SWサイレント障害"],
         "WAN Router": ["4. [WAN] 電源障害：片系", "5. [WAN] 電源障害：両系", "6. [WAN] BGPルートフラッピング", "7. [WAN] FAN故障", "8. [WAN] メモリリーク"],
@@ -473,7 +583,7 @@ if "current_scenario" not in st.session_state:
 # -----------------------------
 # All Companies View (top)
 # -----------------------------
-DF_HEIGHT_5ROWS = 260  # 5行相当（環境でズレる場合はこの値だけ調整）
+DF_HEIGHT_5ROWS = 260  # 5行相当（目安）。環境でズレる場合はこの値だけ調整
 if "selected_scope" not in st.session_state:
     st.session_state.selected_scope = None
 
