@@ -9,9 +9,6 @@ from google.api_core import exceptions as google_exceptions
 
 # モジュール群のインポート
 from registry import list_tenants, list_networks, get_paths, load_topology, topology_mtime
-
-# NOTE: TOPOLOGY is loaded per-tenant/network (see below)
-TOPOLOGY = {}
 from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
 from network_ops import run_diagnostic_simulation, generate_remediation_commands, predict_initial_symptoms, generate_fake_log_by_ai
 from verifier import verify_log_content, format_verification_report
@@ -19,6 +16,47 @@ from inference_engine import LogicalRCA
 
 # --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Autonomous", page_icon="⚡", layout="wide")
+
+
+# ==========================================================
+# Multi-tenant scope (Tenant / Network)
+# ==========================================================
+def _reset_for_scope_change():
+    for k in ["cached_root_cause", "selected_incident", "analysis_results_cache"]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+def _get_scope():
+    tenants = list_tenants()
+    if "tenant_id" not in st.session_state:
+        st.session_state.tenant_id = tenants[0] if tenants else "A"
+    tenant_id = st.sidebar.selectbox(
+        "Tenant",
+        tenants,
+        index=tenants.index(st.session_state.tenant_id) if st.session_state.tenant_id in tenants else 0,
+        key="tenant_id",
+        on_change=_reset_for_scope_change,
+    )
+    networks = list_networks(tenant_id)
+    if "network_id" not in st.session_state:
+        st.session_state.network_id = networks[0] if networks else "default"
+    network_id = st.sidebar.selectbox(
+        "Network",
+        networks,
+        index=networks.index(st.session_state.network_id) if st.session_state.network_id in networks else 0,
+        key="network_id",
+        on_change=_reset_for_scope_change,
+    )
+    return tenant_id, network_id
+
+@st.cache_data(show_spinner=False)
+def _load_topology_cached(topo_path: str, mtime: float):
+    return load_topology(Path(topo_path))
+
+tenant_id, network_id = _get_scope()
+paths = get_paths(tenant_id, network_id)
+TOPOLOGY = _load_topology_cached(str(paths.topology_path), topology_mtime(paths.topology_path))
+CONFIG_DIR = str(paths.config_dir)
 
 # ==========================================
 # 関数定義
@@ -113,68 +151,75 @@ def render_topology(alarms, root_cause_candidates):
 # --- UI構築 ---
 st.title("⚡ Antigravity Autonomous Agent")
 
+
 # ==========================================================
-# 🏢 All Companies View (TOP)
+# All Companies View (Top summary, flood-safe)
 # ==========================================================
 @st.cache_data(show_spinner=False)
-def _summarize_scope(tenant_id: str, network_id: str, scenario: str, topo_mtime: float):
+def _summarize_scope(tenant_id: str, network_id: str, scenario: str, mtime: float):
     p = get_paths(tenant_id, network_id)
     topo = load_topology(p.topology_path)
-    alarms = []
+    cfg_dir = str(p.config_dir)
 
-    # Reuse existing simulate_cascade_failure + local find_target_node_id
-    if scenario.endswith("WAN全回線断"):
+    alarms_local = []
+    # reuse existing simulation helpers from this app
+    if scenario == "WAN全回線断":
         nid = find_target_node_id(topo, node_type="ROUTER")
-        if nid: alarms = simulate_cascade_failure(nid, topo)
-    elif scenario.endswith("FW片系障害"):
+        if nid:
+            alarms_local = simulate_cascade_failure(nid, topo)
+    elif scenario == "FW片系障害":
         nid = find_target_node_id(topo, node_type="FIREWALL")
-        if nid: alarms = simulate_cascade_failure(nid, topo, "Power Supply: Single Loss")
-    elif scenario.endswith("L2SWサイレント障害"):
+        if nid:
+            alarms_local = simulate_cascade_failure(nid, topo, "Power Supply: Single Loss")
+    elif scenario == "L2SWサイレント障害":
         nid = find_target_node_id(topo, node_type="SWITCH", layer=4)
-        if nid: alarms = simulate_cascade_failure(nid, topo, "Link Degraded")
+        if nid:
+            alarms_local = simulate_cascade_failure(nid, topo, "Link Degraded")
 
-    count = len(alarms)
-    if count == 0:
-        health = "Good"
-    elif count < 5:
-        health = "Watch"
-    elif count < 15:
-        health = "Degraded"
+    cnt = len(alarms_local)
+    if cnt == 0:
+        health = "Good"; sev = 0
+    elif cnt < 5:
+        health = "Watch"; sev = 1
+    elif cnt < 15:
+        health = "Degraded"; sev = 2
     else:
-        health = "Down"
+        health = "Down"; sev = 3
 
-    suspected = "-"
-    if alarms:
+    suspected = None
+    if cnt > 0:
         try:
-            r = LogicalRCA(topo, config_dir=str(p.config_dir))
-            res = r.analyze(alarms)
-            if res and isinstance(res, list):
-                suspected = res[0].get("id") or "-"
+            rca_local = LogicalRCA(topo, config_dir=cfg_dir)
+            analysis = rca_local.analyze(alarms_local)
+            # analysis is list of dicts in this project; take top item if present
+            if isinstance(analysis, list) and analysis:
+                top = analysis[0]
+                suspected = top.get("device") or top.get("node_id") or top.get("suspected") or str(top)
         except Exception:
-            suspected = "-"
+            suspected = None
 
-    return {"tenant": tenant_id, "network": network_id, "health": health, "alarms": count, "suspected": suspected}
+    headline = "No active incidents" if cnt == 0 else f"{cnt} alarms (top suspected: {suspected or 'N/A'})"
+    return {"tenant": tenant_id, "network": network_id, "health": health, "severity": sev, "alarms": cnt, "suspected": suspected, "headline": headline}
 
-def _render_all_companies_view(scenario: str):
+def _render_all_companies_view(selected_scenario: str):
     st.subheader("🏢 All Companies View")
+
     rows = []
     for t in list_tenants():
         for n in list_networks(t):
             p = get_paths(t, n)
-            rows.append(_summarize_scope(t, n, scenario, topology_mtime(p.topology_path)))
-    rows.sort(key=lambda r: r["alarms"], reverse=True)
+            rows.append(_summarize_scope(t, n, selected_scenario, topology_mtime(p.topology_path)))
 
-    # Compact list (no alarm flood)
+    rows.sort(key=lambda r: (r["severity"], r["alarms"]), reverse=True)
+
     for r in rows[:10]:
-        c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
+        c1, c2, c3, c4 = st.columns([2, 3, 2, 3])
         c1.write(f"**{r['tenant']} / {r['network']}**")
-        c2.write(r["health"])
+        c2.write(f"**{r['health']}**")
         c3.write(f"Alarms: {r['alarms']}")
-        c4.write(f"Suspected: {r['suspected']}")
+        c4.write(f"Suspected: {r['suspected'] or '-'}")
+
     st.divider()
-
-_render_all_companies_view(selected_scenario)
-
 
 api_key = None
 if "GOOGLE_API_KEY" in st.secrets:
@@ -194,27 +239,7 @@ with st.sidebar:
     }
     selected_category = st.selectbox("対象カテゴリ:", list(SCENARIO_MAP.keys()))
     selected_scenario = st.radio("発生シナリオ:", SCENARIO_MAP[selected_category])
-
-    # --- Tenant / Network (multi-tenant) ---
-    tenants = list_tenants()
-    if "tenant_id" not in st.session_state:
-        st.session_state.tenant_id = tenants[0] if tenants else "A"
-    tenant_id = st.selectbox(
-        "Tenant",
-        tenants if tenants else ["A"],
-        index=(tenants.index(st.session_state.tenant_id) if tenants and st.session_state.tenant_id in tenants else 0),
-        key="tenant_id",
-    )
-
-    networks = list_networks(tenant_id) if tenants else ["default"]
-    if "network_id" not in st.session_state:
-        st.session_state.network_id = networks[0] if networks else "default"
-    network_id = st.selectbox(
-        "Network",
-        networks if networks else ["default"],
-        index=(networks.index(st.session_state.network_id) if networks and st.session_state.network_id in networks else 0),
-        key="network_id",
-    )
+_render_all_companies_view(selected_scenario)
 
     st.markdown("---")
     if api_key: st.success("API Connected")
@@ -222,16 +247,6 @@ with st.sidebar:
         st.warning("API Key Missing")
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
-
-# --- Multi-tenant: load topology & configs for selected scope ---
-try:
-    paths = get_paths(st.session_state.get("tenant_id","A"), st.session_state.get("network_id","default"))
-    TOPOLOGY = load_topology(paths.topology_path)
-    config_dir = str(paths.config_dir)
-except Exception:
-    # Fallback
-    TOPOLOGY = {}
-    config_dir = "./configs"
 
 # --- セッション管理 ---
 if "current_scenario" not in st.session_state:
@@ -244,7 +259,7 @@ for key in ["live_result", "messages", "chat_session", "trigger_analysis", "veri
 
 # エンジン初期化
 if not st.session_state.logic_engine:
-    st.session_state.logic_engine = LogicalRCA(TOPOLOGY, config_dir=config_dir)
+    st.session_state.logic_engine = LogicalRCA(TOPOLOGY, config_dir=CONFIG_DIR)
 
 # シナリオ切り替え時のリセット
 if st.session_state.current_scenario != selected_scenario:
