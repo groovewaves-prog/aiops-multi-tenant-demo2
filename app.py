@@ -495,10 +495,18 @@ for key in ["live_result", "messages", "chat_session", "trigger_analysis", "veri
     if key not in st.session_state:
         st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
 
-# エンジン初期化
-if not st.session_state.logic_engine:
-    st.session_state.logic_engine = LogicalRCA(TOPOLOGY)
+# エンジン初期化（スコープ変更に追随）
+# マルチテナントでは tenant/network 切替でトポロジーが変わるため、
+# LogicalRCA は毎回「現在スコープの TOPOLOGY」で初期化する必要があります。
+try:
+    topo_mtime = os.path.getmtime(paths.topology_path)
+except Exception:
+    topo_mtime = 0.0
+engine_sig = f"{selected_tenant}/{selected_network}:{topo_mtime}"
 
+if st.session_state.get("logic_engine_sig") != engine_sig:
+    st.session_state.logic_engine = LogicalRCA(TOPOLOGY)
+    st.session_state.logic_engine_sig = engine_sig
 # シナリオ切り替え時のリセット
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
