@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-app_cards_multitenant_v4_statusboard_delta_maint_scroll.py
+app_cards_multitenant_v5_statusboard_delta_maint_scroll3rows.py
 
-- 状態ボード（停止 → 劣化 → 要注意 → 正常）
-- デルタ表示（変化があった会社だけ）
+要件:
+- 状態ボード（停止 → 劣化 → 要注意 → 正常）を全社横並びで表示
+- 各列は「デフォルト3行表示」＋縦スクロール（行が増えても画面が伸びない）
+- デルタ表示（変化があった会社だけを一覧に出す）
 - Maintenance グレーアウト（最小版：手動フラグ）
-- “行数が増えすぎる”対策：各列をスクロール可能な表（st.dataframe）で表示
+- 発生シナリオは “最初の app.py” の SCENARIO_MAP / アラーム生成ロジックに合わせる
+- HTML/CSSは使わない（Streamlit標準のみ）
 
 注意:
-- HTML/CSSは使いません（Streamlit標準のみ）。
-- 下段の「AIOpsインシデント・コックピット」は、元の app.py からそのまま貼り付けて復活してください。
+- 下段の「AIOps インシデント・コックピット」は、元の app.py からそのまま貼り付けて復活してください。
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import pandas as pd
 import streamlit as st
 
 from inference_engine import LogicalRCA
-from logic import simulate_cascade_failure
+from logic import Alarm, simulate_cascade_failure
 
 from registry import (
     list_tenants,
@@ -44,34 +46,38 @@ STATUS_LABELS = {"Down": "停止", "Degraded": "劣化", "Watch": "要注意", "
 STATUS_ICON = {"停止": "🟥", "劣化": "🟧", "要注意": "🟨", "正常": "🟩"}
 
 DELTA_WINDOW_MIN = 15
-MAX_ROWS_PER_BUCKET = 200  # 将来スケールの安全弁（UI保護）
+MAX_ROWS_PER_BUCKET = 500  # 将来スケールの安全弁（UI保護）
+
+# “デフォルト3行表示”のための dataframe 高さ（ヘッダ＋3行ぶん）
+DF_HEIGHT_3ROWS = 35 * 4 + 6  # だいたい (ヘッダ1行 + データ3行)
 
 # -----------------------------
-# Scenario map（元の app.py のバリエーションに復帰）
-# - ただし、状態ボード/デモの障害生成は「主要3シナリオ + 正常稼働」のみに紐づけ
+# Scenario map（最初の app.py に準拠）
 # -----------------------------
 SCENARIO_MAP = {
-    "基本・広域障害": [
-        "正常稼働",
-        "1. WAN全回線断",
-        "2. FW片系障害",
-        "3. L2SWサイレント障害",
-        "4. AP群断（エッジ異常）",
-        "5. DC回線遅延（品質劣化）",
-        "6. BGP不安定（断続障害）",
+    "基本・広域障害": ["正常稼働", "1. WAN全回線断", "2. FW片系障害", "3. L2SWサイレント障害"],
+    "WAN Router": [
+        "4. [WAN] 電源障害：片系",
+        "5. [WAN] 電源障害：両系",
+        "6. [WAN] BGPルートフラッピング",
+        "7. [WAN] FAN故障",
+        "8. [WAN] メモリリーク",
     ],
-    "クラウド/アプリ": [
-        "10. [Cloud] DNS障害（名前解決不可）",
-        "11. [Cloud] APIレート制限（429）",
-        "12. [App] 認証障害（Login失敗）",
-        "13. [App] DB遅延（P95悪化）",
+    "Firewall (Juniper)": [
+        "9. [FW] 電源障害：片系",
+        "10. [FW] 電源障害：両系",
+        "11. [FW] FAN故障",
+        "12. [FW] メモリリーク",
     ],
-    "セキュリティ/運用": [
-        "20. [Sec] WAFブロック急増",
-        "21. [Sec] 不審ログイン急増",
-        "22. [Ops] 計画停止（Maintenance）",
+    "L2 Switch": [
+        "13. [L2SW] 電源障害：片系",
+        "14. [L2SW] 電源障害：両系",
+        "15. [L2SW] FAN故障",
+        "16. [L2SW] メモリリーク",
     ],
-    "デモ拡張": [
+    "複合・その他": [
+        "17. [WAN] 複合障害：電源＆FAN",
+        "18. [Complex] 同時多発：FW & AP",
         "99. [Live] Cisco実機診断",
     ],
 }
@@ -111,38 +117,97 @@ def _find_target_node_id(
     topology: Dict[str, Any],
     node_type: Optional[str] = None,
     layer: Optional[int] = None,
+    keyword: Optional[str] = None,
 ) -> Optional[str]:
+    """最初の app.py の find_target_node_id 相当（最小）。"""
     for node_id, node in topology.items():
         if node_type and _node_type(node) != node_type:
             continue
         if layer is not None and _node_layer(node) != layer:
             continue
+        if keyword and keyword not in str(node_id):
+            continue
         return node_id
     return None
 
 
-def _normalize_scenario(s: str) -> str:
-    """SCENARIO_MAPの多様な表現を、デモで扱う主要シナリオに正規化する。"""
-    if "WAN全回線断" in s:
-        return "WAN全回線断"
-    if "FW片系障害" in s or "FW片系" in s:
-        return "FW片系障害"
-    if "L2SWサイレント障害" in s or "L2SW" in s:
-        return "L2SWサイレント障害"
-    return "正常稼働"
+def _make_alarms(topology: Dict[str, Any], selected_scenario: str) -> List[Alarm]:
+    """
+    最初の app.py の「# 1. アラーム生成ロジック」に合わせた挙動。
+    """
+    alarms: List[Alarm] = []
+    # Live はここではアラームを生成しない（運用上は別導線）
+    if "Live" in selected_scenario:
+        return alarms
 
+    if "WAN全回線断" in selected_scenario:
+        target_device_id = _find_target_node_id(topology, node_type="ROUTER")
+        if target_device_id:
+            alarms = simulate_cascade_failure(target_device_id, topology)
+        return alarms
 
-def _make_alarms(topology: Dict[str, Any], normalized_scenario: str):
-    if normalized_scenario == "WAN全回線断":
-        nid = _find_target_node_id(topology, node_type="ROUTER")
-        return simulate_cascade_failure(nid, topology) if nid else []
-    if normalized_scenario == "FW片系障害":
-        nid = _find_target_node_id(topology, node_type="FIREWALL")
-        return simulate_cascade_failure(nid, topology, "Power Supply: Single Loss") if nid else []
-    if normalized_scenario == "L2SWサイレント障害":
-        nid = _find_target_node_id(topology, node_type="SWITCH", layer=4)
-        return simulate_cascade_failure(nid, topology, "Link Degraded") if nid else []
-    return []
+    if "FW片系障害" in selected_scenario:
+        target_device_id = _find_target_node_id(topology, node_type="FIREWALL")
+        if target_device_id:
+            alarms = [Alarm(target_device_id, "Heartbeat Loss", "WARNING")]
+        return alarms
+
+    if "L2SWサイレント障害" in selected_scenario:
+        target_device_id = "L2_SW_01"
+        if target_device_id not in topology:
+            target_device_id = _find_target_node_id(topology, keyword="L2_SW")
+        if target_device_id and target_device_id in topology:
+            # 親(L2)は落ちていないが、配下が落ちる（サイレント障害）
+            child_nodes = [nid for nid, n in topology.items() if getattr(n, "parent_id", None) == target_device_id]
+            alarms = [Alarm(child, "Connection Lost", "CRITICAL") for child in child_nodes]
+        return alarms
+
+    if "複合障害" in selected_scenario:
+        target_device_id = _find_target_node_id(topology, node_type="ROUTER")
+        if target_device_id:
+            alarms = [
+                Alarm(target_device_id, "Power Supply 1 Failed", "CRITICAL"),
+                Alarm(target_device_id, "Fan Fail", "WARNING"),
+            ]
+        return alarms
+
+    if "同時多発" in selected_scenario:
+        fw_node = _find_target_node_id(topology, node_type="FIREWALL")
+        ap_node = _find_target_node_id(topology, node_type="ACCESS_POINT")
+        if fw_node:
+            alarms.append(Alarm(fw_node, "Heartbeat Loss", "WARNING"))
+        if ap_node:
+            alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
+        return alarms
+
+    # それ以外： [WAN] / [FW] / [L2SW] を device type にマップ
+    target_device_id = None
+    if "[WAN]" in selected_scenario:
+        target_device_id = _find_target_node_id(topology, node_type="ROUTER")
+    elif "[FW]" in selected_scenario:
+        target_device_id = _find_target_node_id(topology, node_type="FIREWALL")
+    elif "[L2SW]" in selected_scenario:
+        target_device_id = _find_target_node_id(topology, node_type="SWITCH", layer=4)
+
+    if not target_device_id:
+        return alarms
+
+    if "電源障害：片系" in selected_scenario:
+        alarms = [Alarm(target_device_id, "Power Supply 1 Failed", "WARNING")]
+    elif "電源障害：両系" in selected_scenario:
+        # FWだけは単体Down、それ以外はカスケード
+        if "FW" in str(target_device_id):
+            alarms = [Alarm(target_device_id, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
+        else:
+            alarms = simulate_cascade_failure(target_device_id, topology, "Power Supply: Dual Loss (Device Down)")
+    elif "BGP" in selected_scenario:
+        alarms = [Alarm(target_device_id, "BGP Flapping", "WARNING")]
+    elif "FAN" in selected_scenario:
+        alarms = [Alarm(target_device_id, "Fan Fail", "WARNING")]
+    elif "メモリ" in selected_scenario:
+        alarms = [Alarm(target_device_id, "Memory High", "WARNING")]
+
+    return alarms
 
 
 def _health_from_alarm_count(n: int) -> str:
@@ -157,11 +222,11 @@ def _health_from_alarm_count(n: int) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def _summarize_one_scope(tenant_id: str, network_id: str, normalized_scenario: str, mtime: float) -> Dict[str, Any]:
+def _summarize_one_scope(tenant_id: str, network_id: str, selected_scenario: str, mtime: float) -> Dict[str, Any]:
     paths = get_paths(tenant_id, network_id)
     topology = load_topology(paths.topology_path)
 
-    alarms = _make_alarms(topology, normalized_scenario)
+    alarms = _make_alarms(topology, selected_scenario)
     alarm_count = len(alarms)
     health = _health_from_alarm_count(alarm_count)
 
@@ -184,12 +249,12 @@ def _summarize_one_scope(tenant_id: str, network_id: str, normalized_scenario: s
     }
 
 
-def _collect_all_scopes(normalized_scenario: str) -> List[Dict[str, Any]]:
+def _collect_all_scopes(selected_scenario: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for t in list_tenants():
         for n in list_networks(t):
             p = get_paths(t, n)
-            rows.append(_summarize_one_scope(t, n, normalized_scenario, topology_mtime(p.topology_path)))
+            rows.append(_summarize_one_scope(t, n, selected_scenario, topology_mtime(p.topology_path)))
     return rows
 
 
@@ -198,10 +263,6 @@ def _delta_key(r: Dict[str, Any]) -> str:
 
 
 def _compute_delta(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    session_state に保存された前回値との差分を計算。
-    変化がないものは delta=None にして UI 上は出さない（“埋もれない”）。
-    """
     if "allco_prev" not in st.session_state:
         st.session_state.allco_prev = {}
         st.session_state.allco_prev_ts = _now_iso()
@@ -221,16 +282,9 @@ def _compute_delta(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         if d_alarms == 0 and not d_health:
             out[k] = {"delta": None}
         else:
-            out[k] = {
-                "delta": {
-                    "alarms": d_alarms,
-                    "health_changed": d_health,
-                    "window_min": DELTA_WINDOW_MIN,
-                }
-            }
+            out[k] = {"delta": {"alarms": d_alarms, "health_changed": d_health, "window_min": DELTA_WINDOW_MIN}}
 
-    # 今回値を次回の prev に更新
-    st.session_state.allco_prev = { _delta_key(r): {"alarms": r["alarms"], "health": r["health"]} for r in rows }
+    st.session_state.allco_prev = {_delta_key(r): {"alarms": r["alarms"], "health": r["health"]} for r in rows}
     st.session_state.allco_prev_ts = _now_iso()
     return out
 
@@ -291,28 +345,26 @@ def _render_status_board(rows: List[Dict[str, Any]]):
     for r in rows:
         buckets[_status_jp(r["health"])].append(r)
 
-    # 危険順（左→右）
     col_down, col_degraded, col_watch, col_good = st.columns(4)
     col_map = {"停止": col_down, "劣化": col_degraded, "要注意": col_watch, "正常": col_good}
 
     for status_jp in STATUS_ORDER:
         items = buckets[status_jp]
-        items.sort(key=lambda x: x["alarms"], reverse=True)  # 読み取り速度優先
+        items.sort(key=lambda x: x["alarms"], reverse=True)
         with col_map[status_jp]:
             st.markdown(f"### {_status_badge(status_jp)}  **{len(items)}**")
-
             if not items:
                 st.caption("（該当なし）")
                 continue
 
             df = _render_bucket_df(items, deltas, maint)
 
-            # スクロール表示（行数が増えても縦に伸びない）
+            # デフォルト3行表示＋縦スクロール
             st.dataframe(
                 df,
                 use_container_width=True,
                 hide_index=True,
-                height=360,
+                height=DF_HEIGHT_3ROWS,
             )
 
             if len(items) > MAX_ROWS_PER_BUCKET:
@@ -331,13 +383,11 @@ def _render_status_board(rows: List[Dict[str, Any]]):
 
 
 # -----------------------------
-# Sidebar (元のバリエーションへ復帰)
+# Sidebar
 # -----------------------------
 st.sidebar.markdown("### ⚡ Scenario Controller")
-
 category = st.sidebar.selectbox("対象カテゴリ", list(SCENARIO_MAP.keys()), index=0)
-selected_scenario_raw = st.sidebar.radio("発生シナリオ", SCENARIO_MAP[category])
-normalized_scenario = _normalize_scenario(selected_scenario_raw)
+selected_scenario = st.sidebar.radio("発生シナリオ", SCENARIO_MAP[category])
 
 tenants = list_tenants()
 tenant_id = st.sidebar.selectbox(
@@ -352,7 +402,7 @@ network_id = st.sidebar.selectbox("ネットワーク", networks, index=0)
 # -----------------------------
 # Top: All Companies Status Board
 # -----------------------------
-all_rows = _collect_all_scopes(normalized_scenario)
+all_rows = _collect_all_scopes(selected_scenario)
 _render_status_board(all_rows)
 
 st.markdown("---")
