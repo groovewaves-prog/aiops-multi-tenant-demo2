@@ -4,15 +4,75 @@ import os
 import time
 import google.generativeai as genai
 import json
+from pathlib import Path
 import pandas as pd
 from google.api_core import exceptions as google_exceptions
 
 # モジュール群のインポート
-from data import TOPOLOGY
+from registry import list_tenants, list_networks, get_paths, load_topology, topology_mtime
 from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
 from network_ops import run_diagnostic_simulation, generate_remediation_commands, predict_initial_symptoms, generate_fake_log_by_ai
 from verifier import verify_log_content, format_verification_report
 from inference_engine import LogicalRCA
+
+# ==========================================================
+# Tenant/Network selection (minimal multi-tenant support)
+# ==========================================================
+def _reset_for_scope_change():
+    """Reset session state that must not leak across tenant/network."""
+    for k in [
+        "logic_engine",
+        "messages",
+        "chat_session",
+        "live_result",
+        "current_scenario",
+        "selected_scenario",
+        "last_alarm_count",
+        "cached_root_cause",
+    ]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+def _get_scope():
+    tenants = list_tenants()
+    if "tenant_id" not in st.session_state:
+        st.session_state.tenant_id = tenants[0] if tenants else "A"
+
+    tenant_id = st.sidebar.selectbox(
+        "Tenant",
+        tenants,
+        index=tenants.index(st.session_state.tenant_id) if st.session_state.tenant_id in tenants else 0,
+        key="tenant_id",
+        on_change=_reset_for_scope_change,
+    )
+
+    networks = list_networks(tenant_id)
+    if "network_id" not in st.session_state:
+        st.session_state.network_id = networks[0] if networks else "default"
+
+    network_id = st.sidebar.selectbox(
+        "Network",
+        networks,
+        index=networks.index(st.session_state.network_id) if st.session_state.network_id in networks else 0,
+        key="network_id",
+        on_change=_reset_for_scope_change,
+    )
+    return tenant_id, network_id
+
+
+@st.cache_data(show_spinner=False)
+def _load_topology_cached(topology_path_str: str, mtime: float):
+    # mtime is part of the cache key (auto invalidation on file update)
+    return load_topology(Path(topology_path_str))
+
+
+tenant_id, network_id = _get_scope()
+paths = get_paths(tenant_id, network_id)
+
+topology = _load_topology_cached(str(paths.topology_path), topology_mtime(paths.topology_path))
+config_dir = str(paths.config_dir)
+
 
 # --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Autonomous", page_icon="⚡", layout="wide")
@@ -56,7 +116,7 @@ def generate_content_with_retry(model, prompt, stream=True, retries=3):
             time.sleep(2 * (i + 1))
     return None
 
-def render_topology(alarms, root_cause_candidates):
+def render_topology(topology, alarms, root_cause_candidates):
     """トポロジー図の描画 (AI判定結果を反映)"""
     graph = graphviz.Digraph()
     graph.attr(rankdir='TB')
@@ -70,7 +130,7 @@ def render_topology(alarms, root_cause_candidates):
     # AI判定結果のマッピング
     node_status_map = {c['id']: c['type'] for c in root_cause_candidates}
     
-    for node_id, node in TOPOLOGY.items():
+    for node_id, node in topology.items():
         color = "#e8f5e9"
         penwidth = "1"
         fontcolor = "black"
@@ -96,12 +156,12 @@ def render_topology(alarms, root_cause_candidates):
         
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
     
-    for node_id, node in TOPOLOGY.items():
+    for node_id, node in topology.items():
         if node.parent_id:
             graph.edge(node.parent_id, node_id)
-            parent_node = TOPOLOGY.get(node.parent_id)
+            parent_node = topology.get(node.parent_id)
             if parent_node and parent_node.redundancy_group:
-                partners = [n.id for n in TOPOLOGY.values() 
+                partners = [n.id for n in topology.values() 
                            if n.redundancy_group == parent_node.redundancy_group and n.id != parent_node.id]
                 for partner_id in partners:
                     graph.edge(partner_id, node_id)
@@ -146,7 +206,7 @@ for key in ["live_result", "messages", "chat_session", "trigger_analysis", "veri
 
 # エンジン初期化
 if not st.session_state.logic_engine:
-    st.session_state.logic_engine = LogicalRCA(TOPOLOGY)
+    st.session_state.logic_engine = LogicalRCA(topology, config_dir=config_dir)
 
 # シナリオ切り替え時のリセット
 if st.session_state.current_scenario != selected_scenario:
@@ -173,42 +233,42 @@ is_live_mode = False
 # 1. アラーム生成ロジック
 if "Live" in selected_scenario: is_live_mode = True
 elif "WAN全回線断" in selected_scenario:
-    target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
-    if target_device_id: alarms = simulate_cascade_failure(target_device_id, TOPOLOGY)
+    target_device_id = find_target_node_id(topology, node_type="ROUTER")
+    if target_device_id: alarms = simulate_cascade_failure(target_device_id, topology)
 elif "FW片系障害" in selected_scenario:
-    target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
+    target_device_id = find_target_node_id(topology, node_type="FIREWALL")
     if target_device_id:
         alarms = [Alarm(target_device_id, "Heartbeat Loss", "WARNING")]
         root_severity = "WARNING"
 
 elif "L2SWサイレント障害" in selected_scenario:
     target_device_id = "L2_SW_01"
-    if target_device_id not in TOPOLOGY:
-        target_device_id = find_target_node_id(TOPOLOGY, keyword="L2_SW")
-    if target_device_id and target_device_id in TOPOLOGY:
-        child_nodes = [nid for nid, n in TOPOLOGY.items() if n.parent_id == target_device_id]
+    if target_device_id not in topology:
+        target_device_id = find_target_node_id(topology, keyword="L2_SW")
+    if target_device_id and target_device_id in topology:
+        child_nodes = [nid for nid, n in topology.items() if n.parent_id == target_device_id]
         alarms = [Alarm(child, "Connection Lost", "CRITICAL") for child in child_nodes]
     else:
         st.error("Error: L2 Switch definition not found")
 
 elif "複合障害" in selected_scenario:
-    target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
+    target_device_id = find_target_node_id(topology, node_type="ROUTER")
     if target_device_id:
         alarms = [
             Alarm(target_device_id, "Power Supply 1 Failed", "CRITICAL"),
             Alarm(target_device_id, "Fan Fail", "WARNING")
         ]
 elif "同時多発" in selected_scenario:
-    fw_node = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
-    ap_node = find_target_node_id(TOPOLOGY, node_type="ACCESS_POINT")
+    fw_node = find_target_node_id(topology, node_type="FIREWALL")
+    ap_node = find_target_node_id(topology, node_type="ACCESS_POINT")
     alarms = []
     if fw_node: alarms.append(Alarm(fw_node, "Heartbeat Loss", "WARNING"))
     if ap_node: alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
     target_device_id = fw_node 
 else:
-    if "[WAN]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
-    elif "[FW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
-    elif "[L2SW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="SWITCH", layer=4)
+    if "[WAN]" in selected_scenario: target_device_id = find_target_node_id(topology, node_type="ROUTER")
+    elif "[FW]" in selected_scenario: target_device_id = find_target_node_id(topology, node_type="FIREWALL")
+    elif "[L2SW]" in selected_scenario: target_device_id = find_target_node_id(topology, node_type="SWITCH", layer=4)
 
     if target_device_id:
         if "電源障害：片系" in selected_scenario:
@@ -218,7 +278,7 @@ else:
             if "FW" in target_device_id:
                 alarms = [Alarm(target_device_id, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
             else:
-                alarms = simulate_cascade_failure(target_device_id, TOPOLOGY, "Power Supply: Dual Loss (Device Down)")
+                alarms = simulate_cascade_failure(target_device_id, topology, "Power Supply: Dual Loss (Device Down)")
         elif "BGP" in selected_scenario:
             alarms = [Alarm(target_device_id, "BGP Flapping", "WARNING")]
             root_severity = "WARNING"
@@ -314,14 +374,14 @@ with col_map:
     current_severity = "WARNING"
     
     if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
-        current_root_node = TOPOLOGY.get(selected_incident_candidate["id"])
+        current_root_node = topology.get(selected_incident_candidate["id"])
         if "Hardware/Physical" in selected_incident_candidate["type"] or "Critical" in selected_incident_candidate["type"] or "Silent" in selected_incident_candidate["type"]:
             current_severity = "CRITICAL"
         else:
             current_severity = "WARNING"
 
     elif target_device_id:
-        current_root_node = TOPOLOGY.get(target_device_id)
+        current_root_node = topology.get(target_device_id)
         current_severity = root_severity
 
     st.graphviz_chart(render_topology(alarms, analysis_results), use_container_width=True)
@@ -335,7 +395,7 @@ with col_map:
         else:
             with st.status("Agent Operating...", expanded=True) as status:
                 st.write("🔌 Connecting to device...")
-                target_node_obj = TOPOLOGY.get(target_device_id) if target_device_id else None
+                target_node_obj = topology.get(target_device_id) if target_device_id else None
                 
                 res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key)
                 st.session_state.live_result = res
@@ -483,7 +543,7 @@ with col_chat:
                  if not api_key: st.error("API Key Required")
                  else:
                     with st.spinner("Generating plan..."):
-                        t_node = TOPOLOGY.get(selected_incident_candidate["id"])
+                        t_node = topology.get(selected_incident_candidate["id"])
                         plan_md = generate_remediation_commands(
                             selected_scenario, 
                             f"Identified Root Cause: {selected_incident_candidate['label']}", 
@@ -509,7 +569,7 @@ with col_chat:
                             time.sleep(1.5) 
                             
                             st.write("🔎 Running Verification Commands...")
-                            target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
+                            target_node_obj = topology.get(selected_incident_candidate["id"])
                             verification_log = generate_fake_log_by_ai("正常稼働", target_node_obj, api_key)
                             st.session_state.verification_log = verification_log
                             
