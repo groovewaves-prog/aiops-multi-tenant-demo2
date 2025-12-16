@@ -13,24 +13,42 @@ class HealthStatus(Enum):
 
 # app.pyからの呼び出し名に合わせてクラス名をLogicalRCAに変更
 class LogicalRCA:
-    def __init__(self, topology_file: str, config_dir: str):
+    def __init__(self, topology, config_dir: str = "./configs"):
         """
         LogicalRCA (旧 InferenceEngine) の初期化
-        :param topology_file: トポロジー定義ファイルのパス (topology.json)
-        :param config_dir: コンフィグファイルが格納されているディレクトリ (/configs)
+        :param topology: トポロジー辞書オブジェクト または ファイルパス (str)
+        :param config_dir: コンフィグファイルが格納されているディレクトリ (デフォルト: ./configs)
         """
-        self.topology = self._load_topology(topology_file)
-        self.config_dir = config_dir
+        # topologyが文字列（ファイルパス）の場合はファイルから読み込み
+        if isinstance(topology, str):
+            self.topology = self._load_topology(topology)
+        # 辞書の場合はそのまま使用
+        elif isinstance(topology, dict):
+            self.topology = topology
+        else:
+            raise ValueError("topology must be either a file path (str) or a dictionary")
         
-        # Google Generative AIの設定
+        self.config_dir = config_dir
+        self.model = None
+        self._api_configured = False
+
+    def _ensure_api_configured(self):
+        """APIキーの設定を確認・初期化（遅延評価）"""
+        if self._api_configured:
+            return True
+        
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
-            # APIキーがない場合はエラーログを出力しつつ、動作を継続するか例外を投げる
-            # ここでは明確に例外とする
-            raise ValueError("GOOGLE_API_KEY environment variable is not set.")
+            return False
         
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        try:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            self._api_configured = True
+            return True
+        except Exception as e:
+            print(f"[!] API Configuration Error: {e}")
+            return False
 
     def _load_topology(self, path: str) -> Dict:
         """JSONファイルからトポロジー情報を読み込む"""
@@ -60,6 +78,56 @@ class LogicalRCA:
         text = re.sub(r'(snmp-server community)\s+\S+', r'\1 ********', text)
         return text
 
+    def analyze(self, alarms: List) -> List[Dict[str, Any]]:
+        """
+        アラームリストを分析して根本原因候補を返す
+        app.pyから呼び出される主要なメソッド
+        
+        :param alarms: Alarmオブジェクトのリスト
+        :return: 分析結果のリスト（辞書形式）
+        """
+        results = []
+        
+        if not alarms:
+            return [{
+                "id": "SYSTEM",
+                "label": "No alerts detected",
+                "prob": 0.0,
+                "type": "Normal",
+                "tier": 0
+            }]
+        
+        # 各アラームに対して分析を実行
+        for alarm in alarms:
+            device_id = alarm.device_id
+            alert_messages = [alarm.message]
+            
+            # LLMによる冗長性深度分析
+            analysis = self.analyze_redundancy_depth(device_id, alert_messages)
+            
+            # 結果を整形
+            prob = 0.5  # デフォルト
+            if analysis["status"] == HealthStatus.CRITICAL:
+                prob = 0.9
+            elif analysis["status"] == HealthStatus.WARNING:
+                prob = 0.7
+            else:
+                prob = 0.3
+            
+            results.append({
+                "id": device_id,
+                "label": alarm.message,
+                "prob": prob,
+                "type": analysis["impact_type"],
+                "tier": 1 if prob > 0.6 else 2,
+                "reason": analysis["reason"]
+            })
+        
+        # 確率順にソート
+        results.sort(key=lambda x: x["prob"], reverse=True)
+        
+        return results
+
     def analyze_redundancy_depth(self, device_id: str, alerts: List[str]) -> Dict[str, Any]:
         """
         LLMを使用して冗長性深度を判定する
@@ -71,9 +139,24 @@ class LogicalRCA:
                 "impact_type": "NONE"
             }
 
+        # APIキーの設定を確認
+        if not self._ensure_api_configured():
+            return {
+                "status": HealthStatus.WARNING,
+                "reason": "API key not configured. Manual analysis required.",
+                "impact_type": "UNKNOWN"
+            }
+
         device_info = self.topology.get(device_id, {})
         raw_config = self._read_config(device_id)
-        metadata = device_info.get('metadata', {})
+        
+        # TOPOLOGYが辞書の場合、metadataの取得方法を調整
+        if hasattr(device_info, 'metadata'):
+            metadata = device_info.metadata
+        elif isinstance(device_info, dict):
+            metadata = device_info.get('metadata', {})
+        else:
+            metadata = {}
 
         # サニタイズ
         safe_config = self._sanitize_text(raw_config)
