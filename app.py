@@ -222,7 +222,7 @@ def _summarize_one_scope(tenant_id: str, network_id: str, selected_scenario: str
 
     alarms = _make_alarms(topology, selected_scenario)
     alarm_count = len(alarms)
-    health = _health_from_alarm_count(alarm_count)
+    health = _health_from_alarms(selected_scenario, alarms)
 
     suspected = None
     if alarms:
