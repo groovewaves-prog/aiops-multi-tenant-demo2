@@ -699,7 +699,7 @@ with col_chat:
                     cfg = load_config_sanitized(cand['id'])
                     
                     genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel("gemini-1.5-flash")
+                    model = genai.GenerativeModel("gemma-3-12b-it")
                     
                     verification_context = cand.get("verification_log", "特になし")
                     
@@ -864,7 +864,7 @@ with col_chat:
     with st.expander("💬 Chat with AI Agent", expanded=False):
         if st.session_state.chat_session is None and api_key and selected_scenario != "正常稼働":
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel("gemma-3-12b-it")
             st.session_state.chat_session = model.start_chat(history=[])
 
         for msg in st.session_state.messages:
