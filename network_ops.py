@@ -40,7 +40,7 @@ def generate_fake_log_by_ai(scenario_name, target_node, api_key):
     
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
-        "gemini-1.5-flash",
+        "gemma-3-12b-it",
         generation_config={"temperature": 0.2}
     )
     
@@ -83,7 +83,7 @@ def generate_fake_log_by_ai(scenario_name, target_node, api_key):
 def generate_config_from_intent(target_node, current_config, intent_text, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"temperature": 0.0})
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     vendor = target_node.metadata.get("vendor", "Unknown Vendor")
     os_type = target_node.metadata.get("os", "Unknown OS")
@@ -104,7 +104,7 @@ def generate_config_from_intent(target_node, current_config, intent_text, api_ke
 def generate_health_check_commands(target_node, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"temperature": 0.0})
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     vendor = target_node.metadata.get("vendor", "Unknown Vendor")
     os_type = target_node.metadata.get("os", "Unknown OS")
@@ -122,7 +122,7 @@ def generate_remediation_commands(scenario, analysis_result, target_node, api_ke
     """
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"temperature": 0.0})
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     prompt = f"""
     あなたは熟練したネットワークエンジニアです。
@@ -193,7 +193,7 @@ def predict_initial_symptoms(scenario_name, api_key):
     if not api_key: return {}
     
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"temperature": 0.0})
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     prompt = f"""
     あなたはネットワーク監視システムのAIエージェントです。
