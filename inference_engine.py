@@ -118,7 +118,7 @@ class LogicalRCA:
             return False
         try:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel("gemini-1.5-flash")
+            self.model = genai.GenerativeModel("gemma-3-12b-it")
             self._api_configured = True
             return True
         except Exception as e:
